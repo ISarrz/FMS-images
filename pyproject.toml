@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fms-images"
+version = "0.1.0"
+description = "Загрузка расписаний с ЭлЖур и генерация PNG-скриншотов Excel по параллелям"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "openpyxl>=3.1",
+    "pillow>=10",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5",
+]
+
+[project.scripts]
+fms-images = "fms_images.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ISarrz/FMS-images"
+
+[tool.setuptools]
+packages = ["fms_images"]
