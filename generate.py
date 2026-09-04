@@ -32,6 +32,9 @@ from openpyxl.worksheet.page import PageMargins
 from openpyxl.worksheet.properties import PageSetupProperties
 from PIL import Image, ImageChops
 
+from config import load_config, require_credentials
+from downloader import download_schedules
+
 CROP_PADDING = 12       # белое поле, оставляемое вокруг таблицы после обрезки, px
 SOFFICE_TIMEOUT = 180   # таймаут конвертации в PDF, сек
 
@@ -157,7 +160,7 @@ def process_workbook(src_path: str, output_dir: str, soffice: str, pdftoppm: str
             )
 
         for page_png, sheet_name in zip(pages, sheet_names):
-            safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in sheet_name)
+            safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in sheet_name.strip())
             out_path = os.path.join(output_dir, f"{base}_{safe}.png")
             autocrop(page_png, out_path)
             saved.append(out_path)
@@ -186,7 +189,23 @@ def main() -> int:
     parser.add_argument("--input-dir", default="input", help="каталог с .xlsx (по умолчанию: input)")
     parser.add_argument("--output-dir", default="output", help="куда сохранять PNG (по умолчанию: output)")
     parser.add_argument("--dpi", type=int, default=200, help="разрешение рендеринга (по умолчанию: 200)")
+    parser.add_argument("--download", action="store_true",
+                        help="сначала скачать актуальные расписания с сайта ЭлЖур в --input-dir")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="перезаписывать уже скачанные файлы (с --download)")
+    parser.add_argument("--config", default="config.json", help="путь к config.json (с --download)")
     args = parser.parse_args()
+
+    if args.download:
+        cfg = load_config(args.config)
+        require_credentials(cfg)
+        print("Загрузка расписаний с сайта ЭлЖур...")
+        try:
+            downloaded = download_schedules(cfg, args.input_dir, overwrite=args.overwrite)
+        except RuntimeError as exc:
+            print(f"  {exc}")
+            return 1
+        print(f"  новых файлов: {len(downloaded)}")
 
     soffice = _find_binary(["libreoffice", "soffice"])
     pdftoppm = _find_binary(["pdftoppm"])
