@@ -1,200 +1,168 @@
 """
-FMS-images — генерация PNG-скриншотов расписания уроков из Excel.
+FMS-images — настоящие PNG-скриншоты расписания уроков из Excel.
 
 Каждый лист книги (.xlsx) — это отдельная параллель (например, «10», «11»).
-Скрипт читает каждый лист, учитывает объединённые ячейки и многострочные
-значения и сохраняет по одному PNG на параллель в каталог output/.
+Скрипт рендерит сами листы Excel «как есть» (с родным оформлением: цвета,
+границы, шрифты) и сохраняет по одному PNG на параллель в каталог output/.
+
+Файл НЕ перерисовывается вручную — рендеринг делает LibreOffice:
+    .xlsx  ->  PDF (LibreOffice, каждый лист на отдельной странице)
+           ->  PNG (pdftoppm, по странице на лист)
+           ->  обрезка белых полей (Pillow)
 
 Использование:
     python generate.py                      # обработать все .xlsx из input/
     python generate.py input/05.09.2026.xlsx
-    python generate.py path/to/file.xlsx --input-dir input --output-dir output
+    python generate.py file.xlsx --input-dir input --output-dir output --dpi 200
 
-Рендеринг выполняется пакетом painter (перенесён из проекта FMS-bot).
+Требуются системные пакеты: libreoffice (soffice) и poppler-utils (pdftoppm).
 """
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from typing import List, Optional
 
 import openpyxl
-from openpyxl.utils import get_column_letter
-from PIL import Image, ImageDraw
+from openpyxl.worksheet.page import PageMargins
+from openpyxl.worksheet.properties import PageSetupProperties
+from PIL import Image, ImageChops
 
-from painter import Table, Text, colors
-
-# --- Параметры оформления -------------------------------------------------
-
-BACKGROUND = colors["discord4"]        # цвет фона всего изображения
-HEADER_FILL = colors["discord3"]       # заголовки (шапка / левый столбец)
-BODY_FILL = colors["discord1"]         # ячейки с уроками
-OUTLINE_COLOR = colors["discord2"]     # цвет линий сетки
-TEXT_COLOR = "white"
-
-HEADER_ROWS = 3      # первые N строк листа считаем шапкой
-HEADER_COLS = 3      # первые N столбцов (день/№/время) считаем шапкой
-MAX_LINE_LENGTH = 22  # мягкий перенос длинных слов/строк в ячейке
-
-MARGIN = 20          # поля изображения вокруг таблицы
+CROP_PADDING = 12       # белое поле, оставляемое вокруг таблицы после обрезки, px
+SOFFICE_TIMEOUT = 180   # таймаут конвертации в PDF, сек
 
 
-def _wrap_line(line: str, max_length: int = MAX_LINE_LENGTH) -> List[str]:
-    """Перенос одной строки по словам, чтобы ячейки не были слишком широкими."""
-    words = line.split()
-    if not words:
-        return [""]
-
-    lines: List[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if current and len(candidate) > max_length:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    return lines
+def _find_binary(names: List[str]) -> Optional[str]:
+    for name in names:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
 
 
-def normalize_value(value: str) -> str:
-    """Нормализует текст ячейки: сохраняет исходные переносы и мягко переносит длинные строки."""
-    result: List[str] = []
-    for raw_line in str(value).split("\n"):
-        result.extend(_wrap_line(raw_line.strip()))
-    return "\n".join(result)
-
-
-def _is_header(row: int, column: int) -> bool:
-    return row < HEADER_ROWS or column < HEADER_COLS
-
-
-def build_table(sheet) -> Optional[Table]:
-    """Строит painter.Table из листа Excel. Возвращает None для пустого листа."""
-    height = sheet.max_row
-    width = sheet.max_column
-    if not height or not width:
-        return None
-
-    content: List[List[None]] = [[None for _ in range(width)] for _ in range(height)]
-    table = Table(content=content, left_top=(MARGIN, MARGIN))
-
-    has_text = False
-    for row in range(height):
-        for column in range(width):
-            value = sheet.cell(row=row + 1, column=column + 1).value
-            if value is None or str(value).strip() == "":
-                continue
-            has_text = True
-            is_header = _is_header(row, column)
-            table[row][column].content = Text(
-                value=normalize_value(value),
-                font="Roboto Black" if is_header else "Roboto Bold",
-                size=30 if is_header else 26,
-                fill=TEXT_COLOR,
-            )
-
-    if not has_text:
-        return None
-
-    _apply_merges(table, sheet, height, width)
-    _style_table(table, height, width)
-    return table
-
-
-def _apply_merges(table: Table, sheet, height: int, width: int) -> None:
-    """Переносит объединённые диапазоны Excel в таблицу painter.
-
-    Диапазон объединяется в два прохода: сначала вертикальные полосы по каждому
-    столбцу, затем полосы соединяются по горизонтали — так объединяются только
-    соседние блоки, что и ожидает painter.
-    """
-    for cell_range in sheet.merged_cells.ranges:
-        r0 = cell_range.min_row - 1
-        r1 = cell_range.max_row - 1
-        c0 = cell_range.min_col - 1
-        c1 = cell_range.max_col - 1
-
-        # ограничиваемся фактическими размерами таблицы
-        r1 = min(r1, height - 1)
-        c1 = min(c1, width - 1)
-        if r0 > r1 or c0 > c1 or (r0 == r1 and c0 == c1):
-            continue
-
-        # вертикальные полосы по каждому столбцу диапазона
-        for column in range(c0, c1 + 1):
-            for row in range(r0, r1):
-                table.unite_cells((r0, column), (row + 1, column))
-
-        # соединяем полосы по горизонтали
-        for column in range(c0, c1):
-            table.unite_cells((r0, c0), (r0, column + 1))
-
-
-def _style_table(table: Table, height: int, width: int) -> None:
-    """Задаёт заливку, сетку, отступы и выравнивание ячеек."""
-    for row in range(height):
-        for column in range(width):
-            cell = table[row][column]
-            # пропускаем «поглощённые» части объединённых ячеек
-            if not table._cell_is_active(cell):
-                continue
-
-            if cell.content is None:
-                # пустая ячейка — сливается с фоном, без рамки
-                cell.fill = BACKGROUND
-                cell.outline_width = 0
-                cell.pixels.padding = 0
-                continue
-
-            cell.fill = HEADER_FILL if _is_header(row, column) else BODY_FILL
-            cell.outline_color = OUTLINE_COLOR
-            cell.outline_width = 4
-            cell.pixels.padding = 14
-            cell.horizontal_alignment = "center"
-            cell.vertical_alignment = "center"
-            if cell.content is not None:
-                cell.content.horizontal_alignment = "center"
-
-    table.squeeze()
-
-
-def render_sheet_to_png(sheet, out_path: str) -> bool:
-    """Рендерит один лист в PNG. Возвращает True, если файл сохранён."""
-    table = build_table(sheet)
-    if table is None:
-        return False
-
-    image = Image.new(
-        "RGB",
-        (table.pixels.width + 2 * MARGIN, table.pixels.height + 2 * MARGIN),
-        BACKGROUND,
-    )
-    canvas = ImageDraw.Draw(image)
-    table.draw(canvas)
-    image.save(out_path, format="PNG")
+def sheet_is_empty(sheet) -> bool:
+    for row in sheet.iter_rows():
+        for cell in row:
+            if cell.value is not None and str(cell.value).strip() != "":
+                return False
     return True
 
 
-def process_workbook(xlsx_path: str, output_dir: str) -> List[str]:
-    """Обрабатывает книгу: по одному PNG на лист-параллель. Возвращает пути к файлам."""
-    workbook = openpyxl.load_workbook(xlsx_path, data_only=True)
-    base = os.path.splitext(os.path.basename(xlsx_path))[0]
-    os.makedirs(output_dir, exist_ok=True)
+def prepare_workbook(src_path: str, tmp_dir: str) -> tuple[str, List[str]]:
+    """Готовит копию книги к печати: каждый непустой лист — на одну страницу.
 
+    Возвращает путь к временному .xlsx и список имён листов в том же порядке,
+    в котором они окажутся страницами PDF.
+    """
+    workbook = openpyxl.load_workbook(src_path)
+
+    kept: List[str] = []
+    for name in list(workbook.sheetnames):
+        sheet = workbook[name]
+        if sheet_is_empty(sheet):
+            del workbook[name]
+            continue
+        kept.append(name)
+
+        sheet.page_setup.orientation = "landscape"
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 1
+        sheet.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        sheet.page_margins = PageMargins(
+            left=0.2, right=0.2, top=0.2, bottom=0.2, header=0, footer=0
+        )
+        if sheet.dimensions:
+            sheet.print_area = sheet.dimensions
+
+    tmp_xlsx = os.path.join(tmp_dir, "fit.xlsx")
+    workbook.save(tmp_xlsx)
+    return tmp_xlsx, kept
+
+
+def xlsx_to_pdf(soffice: str, xlsx_path: str, tmp_dir: str) -> str:
+    """Конвертирует .xlsx в PDF через LibreOffice в headless-режиме."""
+    profile_uri = "file://" + os.path.join(tmp_dir, "lo_profile")
+    cmd = [
+        soffice,
+        "--headless",
+        "--norestore",
+        "--convert-to", "pdf",
+        "--outdir", tmp_dir,
+        "-env:UserInstallation=" + profile_uri,
+        xlsx_path,
+    ]
+    subprocess.run(
+        cmd, check=True, timeout=SOFFICE_TIMEOUT,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    pdf_path = os.path.join(tmp_dir, os.path.splitext(os.path.basename(xlsx_path))[0] + ".pdf")
+    if not os.path.isfile(pdf_path):
+        raise RuntimeError(f"LibreOffice не создал PDF: {pdf_path}")
+    return pdf_path
+
+
+def pdf_to_pngs(pdftoppm: str, pdf_path: str, tmp_dir: str, dpi: int) -> List[str]:
+    """Разбивает PDF на PNG постранично (одна страница = один лист)."""
+    prefix = os.path.join(tmp_dir, "page")
+    subprocess.run(
+        [pdftoppm, "-png", "-r", str(dpi), pdf_path, prefix],
+        check=True, timeout=SOFFICE_TIMEOUT,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    return sorted(
+        os.path.join(tmp_dir, f)
+        for f in os.listdir(tmp_dir)
+        if f.startswith("page") and f.endswith(".png")
+    )
+
+
+def autocrop(png_path: str, out_path: str) -> None:
+    """Обрезает белые поля вокруг таблицы и сохраняет результат."""
+    image = Image.open(png_path).convert("RGB")
+    background = Image.new("RGB", image.size, (255, 255, 255))
+    bbox = ImageChops.difference(image, background).getbbox()
+    if bbox:
+        left, top, right, bottom = bbox
+        left = max(0, left - CROP_PADDING)
+        top = max(0, top - CROP_PADDING)
+        right = min(image.width, right + CROP_PADDING)
+        bottom = min(image.height, bottom + CROP_PADDING)
+        image = image.crop((left, top, right, bottom))
+    image.save(out_path, format="PNG")
+
+
+def process_workbook(src_path: str, output_dir: str, soffice: str, pdftoppm: str, dpi: int) -> List[str]:
+    """Обрабатывает книгу: по одному PNG-скриншоту на лист-параллель."""
+    base = os.path.splitext(os.path.basename(src_path))[0]
+    os.makedirs(output_dir, exist_ok=True)
     saved: List[str] = []
-    for sheet_name in workbook.sheetnames:
-        sheet = workbook[sheet_name]
-        safe_name = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in sheet_name)
-        out_path = os.path.join(output_dir, f"{base}_{safe_name}.png")
-        if render_sheet_to_png(sheet, out_path):
+
+    with tempfile.TemporaryDirectory(prefix="fms-images-") as tmp_dir:
+        tmp_xlsx, sheet_names = prepare_workbook(src_path, tmp_dir)
+        if not sheet_names:
+            print("  нет непустых листов — пропущено")
+            return saved
+
+        pdf_path = xlsx_to_pdf(soffice, tmp_xlsx, tmp_dir)
+        pages = pdf_to_pngs(pdftoppm, pdf_path, tmp_dir, dpi)
+
+        if len(pages) != len(sheet_names):
+            print(
+                f"  предупреждение: страниц PDF ({len(pages)}) не совпадает с числом "
+                f"листов ({len(sheet_names)}); сопоставляю по порядку"
+            )
+
+        for page_png, sheet_name in zip(pages, sheet_names):
+            safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in sheet_name)
+            out_path = os.path.join(output_dir, f"{base}_{safe}.png")
+            autocrop(page_png, out_path)
             saved.append(out_path)
             print(f"  параллель {sheet_name!r:>6} -> {out_path}")
-        else:
-            print(f"  параллель {sheet_name!r:>6} — пусто, пропущено")
+
     return saved
 
 
@@ -212,12 +180,25 @@ def collect_inputs(args) -> List[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Генерация PNG-скриншотов расписания из Excel по параллелям (листам)."
+        description="Настоящие PNG-скриншоты расписания из Excel по параллелям (листам)."
     )
     parser.add_argument("files", nargs="*", help="конкретные .xlsx (по умолчанию — все из --input-dir)")
     parser.add_argument("--input-dir", default="input", help="каталог с .xlsx (по умолчанию: input)")
     parser.add_argument("--output-dir", default="output", help="куда сохранять PNG (по умолчанию: output)")
+    parser.add_argument("--dpi", type=int, default=200, help="разрешение рендеринга (по умолчанию: 200)")
     args = parser.parse_args()
+
+    soffice = _find_binary(["libreoffice", "soffice"])
+    pdftoppm = _find_binary(["pdftoppm"])
+    missing = []
+    if not soffice:
+        missing.append("libreoffice (soffice)")
+    if not pdftoppm:
+        missing.append("poppler-utils (pdftoppm)")
+    if missing:
+        print("Не найдены системные зависимости: " + ", ".join(missing))
+        print("Установите их, например: sudo dnf install libreoffice-calc poppler-utils")
+        return 1
 
     inputs = collect_inputs(args)
     if not inputs:
@@ -230,7 +211,10 @@ def main() -> int:
             print(f"Файл не найден: {xlsx_path}")
             continue
         print(f"Обрабатываю {xlsx_path}")
-        total += len(process_workbook(xlsx_path, args.output_dir))
+        try:
+            total += len(process_workbook(xlsx_path, args.output_dir, soffice, pdftoppm, args.dpi))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            print(f"  ошибка при обработке {xlsx_path}: {exc}")
 
     print(f"Готово. Сохранено изображений: {total}")
     return 0 if total else 1
